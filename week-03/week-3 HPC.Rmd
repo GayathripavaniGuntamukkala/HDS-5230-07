@@ -1,0 +1,105 @@
+---
+title: "Week 3"
+author: "Gayathri Pavani Guntamukkala"
+date: "2025-02-09"
+output: html_document
+---
+
+```{r}
+# Load necessary libraries
+install.packages("dplyr")
+install.packages("microbenchmark")
+install.packages("readxl")
+install.packages("microbenchmark")
+install.packages("geosphere")
+library(geosphere)
+library(readxl)
+library(dplyr)
+library(microbenchmark)
+
+
+```
+
+getwd()
+setwd("C:/Users/gayathri/Documents")
+
+```{r}
+# Load the clinic dataset
+df <- read_excel("clinics.xls")
+print(head(df))
+```
+```{r}
+# Convert latitude and longitude columns to numeric 
+df$locLat <- as.numeric(df$locLat)
+df$locLong <- as.numeric(df$locLong)
+
+# Remove rows with NA values in lat/lon
+df <- df[!is.na(df$locLat) & !is.na(df$locLong), ]
+```
+
+```{r}
+# Define the Haversine distance function
+haversine <- function(lat1, lon1, lat2, lon2) {
+  R <- 3958.8  # Radius of Earth in miles
+  
+  # Convert degrees to radians
+  lat1 <- lat1 * pi / 180
+  lon1 <- lon1 * pi / 180
+  lat2 <- lat2 * pi / 180
+  lon2 <- lon2 * pi / 180
+  
+  # Compute differences
+  dlat <- lat2 - lat1
+  dlon <- lon2 - lon1
+  
+  # Haversine formula
+  a <- sin(dlat / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  
+  return(R * c)  # Distance in miles
+}
+```
+
+
+```{r}
+# Approach 1: For-loop implementation
+haversine_looping <- function(df) {
+  distance_list <- numeric(nrow(df))
+  for (i in seq_len(nrow(df))) {
+    distance_list[i] <- haversine(40.671, -73.985, df$locLat[i], df$locLong[i])
+  }
+  return(distance_list)
+}
+```
+
+
+```{r}
+# Approach 2: Vectorized implementation
+haversine_vectorized <- function(df) {
+  return(mapply(haversine, 40.671, -73.985, df$locLat, df$locLong))
+}
+```
+
+
+```{r}
+# Approach 3: Fully optimized with apply
+haversine_apply <- function(df) {
+  apply(df, 1, function(row) {
+    haversine(40.671, -73.985, as.numeric(row["locLat"]), as.numeric(row["locLong"]))
+  })
+}
+```
+
+
+```{r}
+# Profiling and comparison
+benchmark_results <- microbenchmark(
+  Looping = haversine_looping(df),
+  Vectorized = haversine_vectorized(df),
+  Apply = haversine_apply(df),
+  times = 10
+)
+
+print(benchmark_results)
+```
+
