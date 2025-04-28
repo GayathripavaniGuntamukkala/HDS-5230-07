@@ -1,0 +1,311 @@
+---
+title: "Week-11 R_XGBOOST"
+author: "Gayathri Pavani Guntamukkala"
+date: "2025-04-27"
+output: html_document
+---
+
+
+```{r}
+# plot(cars)
+library(mlbench)
+library(purrr)
+library(readr) 
+library(dplyr) 
+```
+ 
+
+```{r}
+
+data("PimaIndiansDiabetes2")
+ds <- as.data.frame(na.omit(PimaIndiansDiabetes2))
+
+# Display original data dimensions
+cat("Original Data Dimensions:\n")
+print(dim(ds))
+
+# Display original data structure
+cat("\nOriginal Data Structure:\n")
+glimpse(ds)
+```
+```{r}
+library(dplyr)
+library(purrr)
+library(readr)
+
+## fit a logistic regression model to obtain a parametric equation
+logmodel <- glm(diabetes ~ ., data = ds, family = "binomial")
+cat("Logistic Model Summary:\n")
+summary(logmodel)
+
+#extract the coefficients and fetch the names of predictors in a vector
+
+cfs <- coefficients(logmodel)    
+prednames <- variable.names(ds)[-9] 
+prednames
+
+sz <- 100000000 ## to be used in sampling
+
+# Generate synthetic data with specified size
+cat(paste("Generating data with target size:", sz, "\n\n"))
+
+# Create predictor data by sampling with replacement from original dataset
+dfdata <- prednames %>% 
+  map_dfc(~ {
+    column <- ds[[.x]]
+    sample(column, size = sz, replace = TRUE)
+  }) %>% 
+  set_names(prednames)
+
+# Display generated data structure
+cat("Generated Predictor Data Structure:\n")
+glimpse(dfdata)
+cat("\n")
+
+# Compute logit values using coefficients from the original model
+pvec <- map(seq_along(prednames), function(pnum) {
+            cfs[pnum + 1] * dfdata[[prednames[pnum]]] # More direct indexing
+          }) %>%
+  reduce(`+`) +
+  cfs[1] ## add the intercept
+
+cat("Logit vector calculation complete.\n")
+
+```
+
+```{r}
+# Compute outcome probability and classify
+probabilities <- 1 / (1 + exp(-pvec))
+dfdata$outcome <- ifelse(probabilities > 0.5, 1, 0)
+
+# Ensure outcome is integer or factor as needed later
+dfdata$outcome <- as.integer(dfdata$outcome) # Use integer 0/1
+
+print("Outcome generation complete.")
+print("Final Generated Data Structure:")
+glimpse(dfdata)
+print("Outcome Distribution:")
+print(table(dfdata$outcome)) # Check distribution
+
+# --- Modification: Save the generated data ---
+output_file <- "generated_pima_data_100M.csv"
+print(paste("Saving generated data to:", output_file))
+# Using readr::write_csv for generally good performance
+write_csv(dfdata, output_file)
+# Alternatively, use data.table::fwrite for potentially faster writing
+# library(data.table)
+# fwrite(dfdata, output_file)
+
+print("Data generation and saving complete.")
+```
+
+
+
+```{r}
+# Load required libraries
+library(purrr)
+library(xgboost)
+library(caret)
+library(dplyr)
+library(readr)
+library(tictoc)
+# Configuration
+data_file <- "generated_pima_data_100M.csv"
+dataset_sizes <- c(100, 1000, 10000, 100000, 1000000, 10000000)
+results_list <- list()
+n_folds <- 5
+
+print(paste("Starting R XGBoost Comparison using", data_file))
+print("---------------------------------")
+
+# Define predictor columns (ensure these match the generated data)
+predictor_cols <- c('pregnant', 'glucose', 'pressure', 'triceps', 'insulin', 'mass', 'pedigree', 'age')
+outcome_col <- 'outcome'
+
+# Loop through dataset sizes 
+for (size in dataset_sizes) {
+    cat(paste("\nProcessing Dataset Size:", size, "\n"))
+
+    # --- Load Data Subset ---
+    tic(paste("Loading", size, "rows"))
+    tryCatch({
+        # Using read_csv from readr. Use fread from data.table for potentially better speed.
+        df_subset <- read_csv(data_file, n_max = size, col_types = cols(.default = col_double(), outcome = col_integer()))
+        # df_subset <- as.data.frame(fread(data_file, nrows = size)) # data.table option
+    }, error = function(e) {
+        cat(paste("Error loading data for size", size, ":", e$message, "\n"))
+        # Skip to next iteration if loading fails
+        next # Use return() if inside a function/lapply, next otherwise
+    })
+    load_time <- toc(quiet = TRUE)
+    cat(paste("Time to load:", round(load_time$toc - load_time$tic, 2), "seconds\n"))
+
+    # Ensure columns exist
+    if (!outcome_col %in% names(df_subset) || !all(predictor_cols %in% names(df_subset))) {
+        cat("Error: Required columns not found in subset for size", size, "\n")
+        next
+    }
+
+    # --- Method 1: Direct xgboost::xgb.cv ---
+    cat("Running Direct xgboost::xgb.cv...\n")
+    # Prepare data for xgboost
+    X_matrix <- as.matrix(df_subset[, predictor_cols])
+    y_vector <- df_subset[[outcome_col]] # Ensure it's numeric 0/1
+
+    # Check data types
+    if(!is.numeric(y_vector)) {
+        cat("Warning: Outcome variable is not numeric for direct xgboost. Attempting conversion.\n")
+        y_vector <- as.numeric(as.character(y_vector)) # Handle potential factors safely
+    }
+     if(!is.matrix(X_matrix) || !is.numeric(X_matrix)){
+         cat("Error: Predictor data is not a numeric matrix for xgboost.\n")
+         next
+     }
+     if(any(is.na(y_vector)) || any(is.na(X_matrix))) {
+         cat("Error: NA values found in data subset for xgboost for size", size, "\n")
+         next
+     }
+
+
+    dtrain <- xgb.DMatrix(data = X_matrix, label = y_vector)
+
+    # Define parameters
+    params <- list(
+        objective = "binary:logistic",
+        eval_metric = "error", # Use error rate (1 - accuracy) for evaluation
+        eta = 0.1,           # Learning rate
+        max_depth = 6        # Max tree depth (typical default)
+    )
+
+    # Run xgb.cv
+    tic("Direct xgb.cv")
+    cv_result_xgb <- tryCatch({
+      xgb.cv(
+          params = params,
+          data = dtrain,
+          nrounds = 100,        # Number of boosting rounds
+          nfold = n_folds,
+          showsd = TRUE,        # Show standard deviation
+          stratified = TRUE,    # Stratify folds for classification
+          verbose = 0,          # Suppress progress messages
+          early_stopping_rounds = 10 # Stop if no improvement
+      )
+    }, error = function(e) {
+         cat("Error during direct xgb.cv for size", size, ":", e$message, "\n")
+         NULL # Return NULL on error
+    })
+    cv_time_xgb <- toc(quiet = TRUE)
+    cv_duration_xgb <- cv_time_xgb$toc - cv_time_xgb$tic
+    cat(paste("Direct xgb.cv time:", round(cv_duration_xgb, 2), "seconds\n"))
+
+    # Extract performance
+    if (!is.null(cv_result_xgb) && nrow(cv_result_xgb$evaluation_log) > 0) {
+        # Find min test error and corresponding accuracy
+        best_iteration <- cv_result_xgb$best_iteration
+        min_error <- cv_result_xgb$evaluation_log$test_error_mean[best_iteration]
+        accuracy_xgb <- 1 - min_error
+        cat(paste("Direct xgb.cv best accuracy:", round(accuracy_xgb, 4), "\n"))
+        results_list[[length(results_list) + 1]] <- list(
+            "Method used" = "XGBoost in R – direct use of xgb.cv() with 5-fold CV",
+            "Dataset size" = size,
+            "Testing-set predictive performance (Mean Accuracy)" = accuracy_xgb,
+            "Time taken for model CV (seconds)" = cv_duration_xgb
+        )
+    } else {
+         results_list[[length(results_list) + 1]] <- list(
+            "Method used" = "XGBoost in R – direct use of xgb.cv() with 5-fold CV",
+            "Dataset size" = size,
+            "Testing-set predictive performance (Mean Accuracy)" = "Error",
+            "Time taken for model CV (seconds)" = cv_duration_xgb # Record time even if accuracy extraction failed
+        )
+    }
+
+
+    # Method 2: XGBoost via caret::train 
+    cat("Running caret::train with XGBoost...\n")
+    # Prepare data for caret (outcome as factor)
+    df_subset_caret <- df_subset
+    # Convert outcome to factor suitable for caret classification
+    df_subset_caret[[outcome_col]] <- factor(paste0("C", df_subset_caret[[outcome_col]]), levels = c("C0", "C1"))
+
+    # Define train control
+    train_ctrl <- trainControl(
+        method = "cv",
+        number = n_folds,
+        verboseIter = FALSE, # Suppress progress messages from caret
+        allowParallel = TRUE # Allow parallel processing if available (setup separately if needed)
+    )
+
+    # Define tune grid (use default params for comparability, set tuneLength=1)
+    # Or explicitly set a single set of parameters matching xgb.cv if possible
+    # tune_grid <- expand.grid(nrounds = 100, # Match nrounds approx.
+    #                          max_depth = 6,
+    #                          eta = 0.1,
+    #                          gamma = 0,
+    #                          colsample_bytree = 0.8,
+    #                          min_child_weight = 1,
+    #                          subsample = 0.5)
+
+
+    # Run caret train
+    tic("caret::train xgbTree")
+    model_caret <- tryCatch({
+      train(
+          formula(paste(outcome_col, "~ .")), # Formula interface
+          data = df_subset_caret,
+          method = "xgbTree",       # Use the xgboost engine
+          trControl = train_ctrl,
+          tuneLength = 1,          # Use default parameters, don't tune hyperparams
+          # tuneGrid = tune_grid,   # Alternative: specify exact parameters
+          verbose = 0              # Suppress xgboost's own verbose output
+      )
+    }, warning = function(w){
+        cat("Warning during caret train for size", size, ":", w$message, "\n")
+        # Attempt to proceed if it's just a warning
+        suppressWarnings(train(formula(paste(outcome_col, "~ .")), data = df_subset_caret, method = "xgbTree", trControl = train_ctrl, tuneLength = 1, verbose = 0))
+    }, error = function(e) {
+         cat("Error during caret train for size", size, ":", e$message, "\n")
+         NULL # Return NULL on error
+    })
+    cv_time_caret <- toc(quiet = TRUE)
+    cv_duration_caret <- cv_time_caret$toc - cv_time_caret$tic
+    cat(paste("caret::train time:", round(cv_duration_caret, 2), "seconds\n"))
+
+    # Extract performance
+    if (!is.null(model_caret)) {
+        # caret's results usually contain accuracy directly
+        accuracy_caret <- max(model_caret$results$Accuracy) # Get accuracy (max needed if tuneLength > 1)
+        cat(paste("caret::train accuracy:", round(accuracy_caret, 4), "\n"))
+         results_list[[length(results_list) + 1]] <- list(
+            "Method used" = "XGBoost in R – via caret, with 5-fold CV",
+            "Dataset size" = size,
+            "Testing-set predictive performance (Mean Accuracy)" = accuracy_caret,
+            "Time taken for model CV (seconds)" = cv_duration_caret
+        )
+    } else {
+         results_list[[length(results_list) + 1]] <- list(
+            "Method used" = "XGBoost in R – via caret, with 5-fold CV",
+            "Dataset size" = size,
+            "Testing-set predictive performance (Mean Accuracy)" = "Error",
+            "Time taken for model CV (seconds)" = cv_duration_caret
+        )
+    }
+
+    # Optional: Clean up memory for the next iteration, especially important for large datasets
+    rm(df_subset, X_matrix, y_vector, dtrain, cv_result_xgb, df_subset_caret, model_caret)
+    gc() # Garbage collect
+
+} # End loop over dataset sizes
+
+# Reporting 
+cat("\n=========================================\n")
+cat("             R XGBoost Results Summary\n")
+cat("=========================================\n")
+results_df_r <- bind_rows(results_list)
+print(results_df_r)
+cat("=========================================\n")
+
+# Save results to CSV
+write_csv(results_df_r, "xgboost_r_results.csv")
+cat("\nR results saved to xgboost_r_results.csv\n")
+
